@@ -331,6 +331,12 @@ async function handlePrivateChatMessage(msg, env, ctx) {
   if (msg.text) {
     const spamVerdict = await evaluateRepeatSpam(userId, msg.text, env, now);
     if (spamVerdict.blocked) {
+      await notifyAdminSpamIntercept(userId, msg, env, {
+        action: "cooldown",
+        score: 0,
+        reasons: spamVerdict.reasons || ["repeat:text"],
+        detail: "重复骚扰内容触发自动冷却",
+      });
       await shawTelegramCall(env, "sendMessage", {
         chat_id: userId,
         text: "🚫 检测到重复骚扰内容，账号已临时冷却。",
@@ -342,6 +348,12 @@ async function handlePrivateChatMessage(msg, env, ctx) {
   if (!(isTrusted && SHAW_SETTINGS.trust.trustedBypassAdCheck)) {
     const adVerdict = await evaluateAdSpam(userId, msg, isNewUser, env, now);
     if (adVerdict.blocked) {
+      await notifyAdminSpamIntercept(userId, msg, env, {
+        action: "cooldown",
+        score: adVerdict.score,
+        reasons: adVerdict.reasons,
+        detail: "疑似广告/引流内容触发自动冷却",
+      });
       await shawTelegramCall(env, "sendMessage", {
         chat_id: userId,
         text: "🚫 检测到疑似广告/引流内容，账号已临时冷却。",
@@ -350,6 +362,12 @@ async function handlePrivateChatMessage(msg, env, ctx) {
     }
 
     if (adVerdict.warned) {
+      await notifyAdminSpamIntercept(userId, msg, env, {
+        action: "drop",
+        score: adVerdict.score,
+        reasons: adVerdict.reasons,
+        detail: "疑似广告/引流内容，本条已拦截但未冷却",
+      });
       await shawTelegramCall(env, "sendMessage", {
         chat_id: userId,
         text: "⛔ 检测到疑似广告特征，本条消息已拦截且未转发。请勿发送链接、联系方式或转发推广内容。",
@@ -539,7 +557,7 @@ async function evaluateRepeatSpam(userId, text, env, now) {
 
   if (state.count >= SHAW_SETTINGS.antiSpam.repeatThreshold) {
     await applyAutoCooldownIfAllowed(userId, now + SHAW_SETTINGS.antiSpam.cooldownMs, env);
-    return { blocked: true };
+    return { blocked: true, reasons: [`repeat:text:${state.count}`] };
   }
 
   return { blocked: false };
@@ -549,7 +567,7 @@ async function evaluateAdSpam(userId, msg, isNewUser, env, now) {
   const key = SHAW_KV.spamState(userId);
   const state = ensureSpamStateShape(await env.PM.get(key, { type: "json" }));
 
-  const { score } = scoreSpamSignals(msg);
+  const { score, reasons } = scoreSpamSignals(msg, isNewUser);
   const hardScore = isNewUser ? SHAW_SETTINGS.antiSpam.hardScoreNew : SHAW_SETTINGS.antiSpam.hardScoreNormal;
   const softScore = isNewUser ? SHAW_SETTINGS.antiSpam.softScoreNew : SHAW_SETTINGS.antiSpam.softScoreNormal;
   const riskHitLimit = isNewUser
@@ -567,7 +585,7 @@ async function evaluateAdSpam(userId, msg, isNewUser, env, now) {
     state.lastAt = now;
     await env.PM.put(key, JSON.stringify(state), { expirationTtl: 24 * 3600 });
     await applyAutoCooldownIfAllowed(userId, now + SHAW_SETTINGS.antiSpam.cooldownMs, env);
-    return { blocked: true, warned: false };
+    return { blocked: true, warned: false, score, reasons };
   }
 
   if (score >= softScore) {
@@ -577,10 +595,10 @@ async function evaluateAdSpam(userId, msg, isNewUser, env, now) {
 
     if (state.riskHits >= riskHitLimit) {
       await applyAutoCooldownIfAllowed(userId, now + SHAW_SETTINGS.antiSpam.cooldownMs, env);
-      return { blocked: true, warned: false };
+      return { blocked: true, warned: false, score, reasons };
     }
 
-    return { blocked: false, warned: true };
+    return { blocked: false, warned: true, score, reasons };
   }
 
   // 正常消息轻度衰减风险计数，降低误伤
@@ -590,7 +608,7 @@ async function evaluateAdSpam(userId, msg, isNewUser, env, now) {
     await env.PM.put(key, JSON.stringify(state), { expirationTtl: 24 * 3600 });
   }
 
-  return { blocked: false, warned: false };
+  return { blocked: false, warned: false, score, reasons };
 }
 
 function ensureSpamStateShape(raw) {
@@ -603,23 +621,53 @@ function ensureSpamStateShape(raw) {
   };
 }
 
-function scoreSpamSignals(msg) {
+function scoreSpamSignals(msg, isNewUser = false) {
   let score = 0;
+  const reasons = [];
   const text = (msg.text || msg.caption || "").trim();
   const normalized = normalizeText(text);
   const compact = compactForKeywordMatch(normalized);
 
   // 转发消息是目前最常见的广告绕过路径，直接高权重
-  if (isForwardedMessage(msg)) score += 4;
-  if (msg.via_bot) score += 2;
+  if (isForwardedMessage(msg)) {
+    score += 4;
+    reasons.push("forwarded:4");
+  }
+  if (msg.via_bot) {
+    score += 2;
+    reasons.push("via_bot:2");
+  }
 
   const entities = [...(msg.entities || []), ...(msg.caption_entities || [])];
   const riskyEntityTypes = new Set(["url", "text_link", "mention", "phone_number"]);
   const riskyEntities = entities.filter((e) => riskyEntityTypes.has(e.type));
-  score += Math.min(3, riskyEntities.length);
+  if (riskyEntities.length > 0) {
+    const entityScore = Math.min(3, riskyEntities.length);
+    score += entityScore;
+    reasons.push(`entity:${riskyEntities.map((e) => e.type).join(",")}:${entityScore}`);
+  }
 
-  if (/(https?:\/\/|t\.me\/|telegram\.me\/|tg:\/\/|telegra\.ph\/)/i.test(normalized)) score += 3;
-  if (/@[\p{L}\p{N}_]{5,}/u.test(normalized)) score += 2;
+  if (/(https?:\/\/|t\.me\/|telegram\.me\/|tg:\/\/|telegra\.ph\/)/i.test(normalized)) {
+    score += 3;
+    reasons.push("link:3");
+  }
+  if (/@[\p{L}\p{N}_]{5,}/u.test(normalized)) {
+    score += 2;
+    reasons.push("mention_text:2");
+  }
+
+  if (isNewUser && msg.document) {
+    score += 2;
+    reasons.push("new_user_document:2");
+  }
+  if (isNewUser && msg.video) {
+    score += 1;
+    reasons.push("new_user_video:1");
+  }
+  if (isNewUser && msg.photo?.length && !text) {
+    score += 1;
+    reasons.push("new_user_photo_without_caption:1");
+  }
 
   if (
     /(群发|引流|广告|推广|全网覆盖|自动群发|免费试用|兼职|返利|代发|频道|电报号|飞机号|加群|拉群|私聊我|联系我|home\s*office|job|日入|详情咨询|咨询)/i.test(
@@ -631,6 +679,7 @@ function scoreSpamSignals(msg) {
     )
   ) {
     score += 2;
+    reasons.push("keyword:ad_contact:2");
   }
 
   // 软性引流文案（无链接也常见）：例如“找合作伙伴/感兴趣回我/细节私聊”
@@ -642,15 +691,61 @@ function scoreSpamSignals(msg) {
     /(合作伙伴|找\d+[-~到]?\d*个|感兴趣|详聊|细节可?私聊|长期稳定|私聊)/i.test(compact)
   ) {
     score += 2;
+    reasons.push("keyword:soft_lure:2");
   }
 
   const density = computeNoiseDensity(normalized);
-  if (density.emojiRatio >= 0.3) score += 2;
-  if (density.symbolRatio >= 0.35 && density.symbolCount >= 6) score += 2;
+  if (density.emojiRatio >= 0.3) {
+    score += 2;
+    reasons.push(`emoji_density:${density.emojiRatio.toFixed(2)}:2`);
+  }
+  if (density.symbolRatio >= 0.35 && density.symbolCount >= 6) {
+    score += 2;
+    reasons.push(`symbol_density:${density.symbolRatio.toFixed(2)}:2`);
+  }
 
-  if (text.split(/\n+/).length >= 4) score += 1;
+  if (text.split(/\n+/).length >= 4) {
+    score += 1;
+    reasons.push("multi_line:1");
+  }
 
-  return { score };
+  return { score, reasons };
+}
+
+async function notifyAdminSpamIntercept(userId, msg, env, verdict) {
+  const topic = await getUserTopicIfExists(userId, env);
+  const reasons = verdict.reasons?.length ? verdict.reasons.join("、") : "unknown";
+  const preview = (msg.text || msg.caption || `[${detectMessageKind(msg)}]`).slice(0, 300);
+  const actionText = verdict.action === "cooldown" ? "已自动冷却" : "仅拦截本条";
+
+  const payload = {
+    chat_id: Number(env.SUPERGROUP_ID),
+    text: [
+      "🛡️ <b>骚扰拦截通知</b>",
+      `UID: <code>${userId}</code>`,
+      `处理: <code>${escapeHtml(actionText)}</code>`,
+      `分数: <code>${Number(verdict.score || 0)}</code>`,
+      `原因: <code>${escapeHtml(reasons)}</code>`,
+      `说明: ${escapeHtml(verdict.detail || "-")}`,
+      "",
+      `<b>内容预览</b>:\n<code>${escapeHtml(preview)}</code>`,
+    ].join("\n"),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+
+  if (topic?.threadId) payload.message_thread_id = topic.threadId;
+  await shawTelegramCall(env, "sendMessage", payload);
+}
+
+function detectMessageKind(msg) {
+  if (msg.photo?.length) return "photo";
+  if (msg.video) return "video";
+  if (msg.document) return "document";
+  if (msg.sticker) return "sticker";
+  if (msg.voice) return "voice";
+  if (msg.audio) return "audio";
+  return "non_text_message";
 }
 
 function isForwardedMessage(msg) {
