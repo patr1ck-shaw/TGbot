@@ -603,25 +603,42 @@ function scoreSpamSignals(msg, isNewUser = false) {
   return { score, reasons };
 }
 
-// 2. 优化管理员拦截日志推送（仅在专属话题内推送简短提示，不包含违规原文）
+// 2. 优化管理员拦截日志推送（仅在专属话题内推送精简、易懂的中文提示）
 async function notifyAdminSpamIntercept(userId, msg, env, verdict) {
   try {
     const supergroupId = Number(env.SUPERGROUP_ID);
     const topic = await getUserTopicIfExists(userId, env);
 
-    // 如果该用户还没有专属话题（Topic），直接不发送，避免发到通用频道
     if (!topic || !topic.threadId) {
       return;
     }
 
-    // 只发送一行精简的拦截状态，不展示 safeText 原文
-    const logText = `⚠️ <b>[系统提示]</b> 该用户最新发送的消息已被拦截（动作: <code>${verdict.action}</code> | 原因: <code>${verdict.reasons.join(", ")}</code>）`;
+    // 💡 将底层代号归类并精简为通俗易懂的中文说明
+    const simplifiedReasons = [];
+    for (const r of verdict.reasons) {
+      if (r.startsWith("forwarded")) simplifiedReasons.push("发送了转发消息");
+      else if (r.startsWith("via_bot")) simplifiedReasons.push("使用了内联机器人");
+      else if (r.includes("url") || r.includes("link") || r.includes("t.me")) simplifiedReasons.push("包含网址或链接");
+      else if (r.includes("mention") || r.includes("phone")) simplifiedReasons.push("包含 @提及 或电话号码");
+      else if (r.includes("keyword")) simplifiedReasons.push("包含广告关键词");
+      else if (r.startsWith("new_user_")) simplifiedReasons.push("新用户受限媒体");
+      else if (r === "workers_ai:spam") simplifiedReasons.push("AI识别为垃圾广告");
+      else if (r.startsWith("repeat:text")) simplifiedReasons.push("重复刷屏");
+      else simplifiedReasons.push("触发风控规则");
+    }
+
+    // 数组去重，避免重复提示同一类原因
+    const uniqueReasons = [...new Set(simplifiedReasons)];
+    const actionDesc = verdict.action === "cooldown" ? "已触发冷却禁言" : "已拦截单条消息";
+
+    // 保持只发送精简的一行
+    const logText = `⚠️ <b>[系统提示]</b> 消息已被拦截（动作: <code>${actionDesc}</code> | 原因: <b>${uniqueReasons.join("、")}</b>）`;
 
     const payload = {
       chat_id: supergroupId,
       text: logText,
       parse_mode: "HTML",
-      message_thread_id: topic.threadId, // 仅发到当前用户的专属话题内
+      message_thread_id: topic.threadId, 
     };
 
     await shawTelegramCall(env, "sendMessage", payload);
