@@ -878,27 +878,50 @@ async function cleanupUserScopedData(userId, env) {
   return { deleted, hasMore: false };
 }
 
-// --- Topic 内消息转发给私聊用户 ---
-
+// --- 修改后的 Topic 内消息转发给私聊用户（支持直接在话题里发 /trust /untrust） ---
 async function handleSupergroupThreadMessage(msg, env, ctx) {
   const threadId = msg.message_thread_id;
   const userId = Number(await env.PM.get(SHAW_KV.userByThread(threadId)) || 0);
   if (!userId) return;
 
   const text = (msg.text || "").trim();
+  const groupId = Number(env.SUPERGROUP_ID);
+
+  // 校验发送者是否为管理员
+  const isAdmin = await isGroupAdmin(env, groupId, msg.from?.id);
+
   if (text === "/close") {
+    if (!isAdmin) return;
     await setTopicClosedByThread(threadId, true, env);
-    await shawTelegramCall(env, "closeForumTopic", { chat_id: Number(env.SUPERGROUP_ID), message_thread_id: threadId });
+    await shawTelegramCall(env, "closeForumTopic", { chat_id: groupId, message_thread_id: threadId });
     return;
   }
   if (text === "/open") {
+    if (!isAdmin) return;
     await setTopicClosedByThread(threadId, false, env);
-    await shawTelegramCall(env, "reopenForumTopic", { chat_id: Number(env.SUPERGROUP_ID), message_thread_id: threadId });
+    await shawTelegramCall(env, "reopenForumTopic", { chat_id: groupId, message_thread_id: threadId });
     return;
   }
   if (text === "/uf") {
+    if (!isAdmin) return;
     const ok = await unfreezeUser(userId, env);
-    await shawTelegramCall(env, "sendMessage", { chat_id: Number(env.SUPERGROUP_ID), message_thread_id: threadId, text: ok ? `✅ 已解封 UID ${userId}` : `⚠️ UID ${userId} 当前无冷却` });
+    await shawTelegramCall(env, "sendMessage", { chat_id: groupId, message_thread_id: threadId, text: ok ? `✅ 已解封 UID ${userId}` : `⚠️ UID ${userId} 当前无冷却` });
+    return;
+  }
+
+  // 💡 新增：允许直接在当前用户的专属话题内输入 /trust，不需要写 UID
+  if (text === "/trust") {
+    if (!isAdmin) return;
+    const ok = await setUserTrust(userId, true, msg.from?.id, env);
+    await shawTelegramCall(env, "sendMessage", { chat_id: groupId, message_thread_id: threadId, text: ok ? `✅ 已将当前话题用户 (UID ${userId}) 加入信任列表` : `⚠️ 操作失败，该用户可能未验证或无效` });
+    return;
+  }
+
+  // 💡 新增：允许直接在当前话题内输入 /untrust
+  if (text === "/untrust") {
+    if (!isAdmin) return;
+    const ok = await setUserTrust(userId, false, msg.from?.id, env);
+    await shawTelegramCall(env, "sendMessage", { chat_id: groupId, message_thread_id: threadId, text: ok ? `✅ 已取消当前话题用户 (UID ${userId}) 的信任` : `⚠️ 操作失败` });
     return;
   }
 
@@ -907,7 +930,7 @@ async function handleSupergroupThreadMessage(msg, env, ctx) {
     return;
   }
 
-  await shawTelegramCall(env, "copyMessage", { chat_id: userId, from_chat_id: Number(env.SUPERGROUP_ID), message_id: msg.message_id });
+  await shawTelegramCall(env, "copyMessage", { chat_id: userId, from_chat_id: groupId, message_id: msg.message_id });
 }
 
 async function getUserTopicIfExists(userId, env) {
