@@ -648,7 +648,9 @@ async function notifyAdminSpamIntercept(userId, msg, env, verdict) {
 }
 
 function isForwardedMessage(msg) {
-  return Boolean(msg.forward_origin || msg.forward_from || msg.forward_from_chat || msg.forward_sender_name || msg.forward_date || msg.is_automatic_forward);
+  const isStdForward = Boolean(msg.forward_origin || msg.forward_from || msg.forward_from_chat || msg.forward_sender_name || msg.forward_date || msg.is_automatic_forward);
+  const isSpecialComponent = Boolean(msg.checklist || msg.poll || msg.story);
+  return isStdForward || isSpecialComponent;
 }
 
 
